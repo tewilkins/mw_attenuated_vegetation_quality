@@ -1,5 +1,5 @@
 # Load mwstr functions:
-source("~/uomShare/wergStaff/ChrisW/mwstr_v13/mwstr_network_functions.R")
+# source("~/uomShare/wergStaff/ChrisW/mwstr_v13/mwstr_network_functions.R")
 
 tiff_dir <- "~/uomShare/wergStaff/ChrisW/mwstr_v13/"
 

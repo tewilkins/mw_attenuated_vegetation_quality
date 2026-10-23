@@ -43,7 +43,7 @@ library(terra)
 library(sf)
 library(DBI)
 
-# Connect to mwstr database:
+# Connect to mwstr database (from gpkg file - can use mwstr db if it's more reliable):
 mwstr <- DBI::dbConnect(RSQLite::SQLite(), 
                       "~/uomShare/wergStaff/ChrisW/mwstr_v13/mwstr_v1.3.1.gpkg")
 
@@ -172,17 +172,71 @@ aq_site <- function(sitecode_or_reach,
   )
   
   rasti <- terra::mask(rasti, rasti$d2ol)
-  
+
   # Apply exponential attenuation along W only (in-stream length)
   weight <- exp(log(0.5) * rasti$d2ol / W)
   
-  # Calculate the weighted mean of the spatial variable
-  aq <- terra::global(rasti$lyr1 * weight,
-                      fun = "sum",
-                      na.rm = TRUE)$sum /
-        terra::global(weight * 25,
-                      fun = "sum",
-                      na.rm = TRUE)$sum
+  # Select vegetation-condition layer
+  veg <- rasti[[1]]
+
+  # Exclude cells without vegetation-condition data
+  valid <- !is.na(veg)
+
+  # Apply the same mask to the weights
+  veg <- terra::mask(veg, valid)
+  weight_valid <- terra::mask(weight, valid)
+
+  # Calculate weighted mean
+  weighted_cells <- terra::global(
+    veg * weight_valid,
+    fun = "sum",
+    na.rm = TRUE
+  )$sum
+
+  total_cells <- terra::global(
+    weight_valid,
+    fun = "sum",
+    na.rm = TRUE
+  )$sum
+  
+  # Diagnostics - comment out later
+  
+  # Layer name
+  cat("Vegetation layer name:\n")
+  print(names(rasti))
+  
+  # Layer value range
+  cat("\nVegetation statistics:\n")
+  print(terra::global(
+    rasti[[1]],
+    fun = c("min", "max", "mean"),
+    na.rm = TRUE
+  ))
+  
+  # Check that the weighted numerator and denominator are calculated correctly
+  cat("\nWeighted numerator:\n")
+  print(terra::global(
+    rasti[[1]] * weight,
+    fun = "sum",
+    na.rm = TRUE
+  ))
+  
+  cat("\nWeighted denominator:\n")
+  print(terra::global(
+    weight * 25,
+    fun = "sum",
+    na.rm = TRUE
+  ))
+
+  aq <- weighted_cells / total_cells
+  
+  # # Calculate the weighted mean of the spatial variable
+  # aq <- terra::global(rasti$lyr1 * weight,
+  #                     fun = "sum",
+  #                     na.rm = TRUE)$sum /
+  #       terra::global(weight * 25,
+  #                     fun = "sum",
+  #                     na.rm = TRUE)$sum
   
   gc()
   aq
@@ -204,7 +258,7 @@ for (i in 1:nrow(sites_nathan_bugs3)){
   sites_nathan_bugs3$aq_w1000[i] <- aq_site(sites_nathan_bugs3$sitecode_v12[i],
                                              prepared_data = prepared_vq_list,
                                              W = 1000,
-                                             max_us = 8000)
+                                             max_us = 6000)
   end_time <- Sys.time()
   print(paste0("Finished calculating aq for site ", i, " of ", nrow(sites_nathan_bugs3), 
                " in ", round(difftime(end_time, start_time, units = "mins"), 2), " minutes."))
@@ -215,6 +269,21 @@ saveRDS(sites_nathan_bugs3, file = "~/uomShare/wergStaff/RyanBurrows/Students/Na
 
 ```
 
+## Evaluating attenuated vegetation quality for 132 streams in the network
 
+```{r}
+
+
+
+sites_nathan_bugs3 <- readRDS("~/uomShare/wergStaff/RyanBurrows/Students/Nathan/Data/sites_nathan_bugs3_aq_w1000.rds")
+
+plot(
+  sites_nathan_bugs3$aq_w1000,
+  sites_nathan_bugs3$vv20average,
+  xlab = "Attenuated vegetation quality (W=1000)",
+  ylab = "Attenuated vegetation quality (W=1000, 2019)",
+  main = "Comparison of attenuated vegetation quality metrics")
+
+```
 
 
