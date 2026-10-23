@@ -1,0 +1,220 @@
+---
+title: "Attenuated vegetation quality for Melbourne Water streams"
+author: "Thomas Wilkins"
+format: html
+editor: visual
+bibliography: ../references.bib
+---
+
+## Introduction
+
+This document outlines steps taken to produce the attenuated vegetation quality (AV) metric for Melbourne Water streams. The metric is an edited version of Chris Walsh's Attenuated Forest cover (AF) metric [@walsh2014], calculated with in-stream hyperparameterisation only (AF measures overland and in-stream attenuation jointly).
+
+```{r}
+#| label: setup
+
+
+# Load mwstr functions:
+source("~/uomShare/wergStaff/ChrisW/mwstr_v13/mwstr_network_functions.R")
+
+tiff_dir <- "~/uomShare/wergStaff/ChrisW/mwstr_v13/"
+
+# Read in TIFF file:
+veg_tiff <- "~/uomShare/wergProj/W12 - Revegetation/RMIT project/predicted_masked.tif"
+
+# View raster later:
+predicted_masked <- terra::rast(veg_tiff)
+
+# Checking properties of the raster:
+names(predicted_masked)
+terra::nlyr(predicted_masked)
+terra::ext(predicted_masked)
+
+terra::plot(predicted_masked)
+
+```
+
+
+
+```{r}
+#| label: prepare_av_site_data
+
+library(terra)
+library(sf)
+library(DBI)
+
+# Connect to mwstr database:
+mwstr <- DBI::dbConnect(RSQLite::SQLite(), 
+                      "~/uomShare/wergStaff/ChrisW/mwstr_v13/mwstr_v1.3.1.gpkg")
+
+
+subcs <- sf::st_read(mwstr, 
+                       query = paste0("SELECT subcs.reach, subcs.site, subcs.nextds, subcs.nus, ",
+                                      "subcs.agg_order, subc_env.d2ol_pp, subcs.geom, subcs.tot_length_m FROM subcs ",
+                                      "JOIN subc_env ON subcs.site = subc_env.site ",
+                                      "ORDER BY subcs.agg_order, subcs.nus, subcs.reach;"))
+
+
+sf::st_crs(subcs) <- 7855 # Set CRS to EPSG:7855 (GDA2020 / MGA zone 55)
+subcs_t <- terra::vect(subcs) # Convert to terra vector
+sf::st_geometry(subcs) <- NULL # Remove geometry from subcs to save memory
+subcs_ig <- apply(subcs[c("site","nextds")], 2, as.character) # Create graph dataframe from subcs
+subcs_ig <- igraph::graph_from_data_frame(subcs_ig) # Convert to igraph object
+rm(subcs) # Remove subcs to save memory
+
+subc_pps <- sf::st_read(mwstr, query = "SELECT * FROM subc_pps;") # Read in subc_pps table
+subc_pps <- subc_pps[match(subcs_t$site, subc_pps$site),] # Reorder subc_pps to match subcs_t
+subc_pps <- terra::vect(subc_pps) # Convert to terra vector
+
+# Rasterize stream network tiffs:
+r_site <- terra::rast(paste0(tiff_dir, "/r_site.tif"))
+d2str <- terra::rast(paste0(tiff_dir, "/r_d2str.tif"))
+d2ol <- terra::rast(paste0(tiff_dir, "/r_d2ol.tif"))
+
+# Cropping vegq to match the extent of r_site:
+vegq <- terra::rast(veg_tiff)
+if(terra::crs(r_site) != terra::crs(vegq)) {
+  vegq <- project(vegq, terra::crs(r_site))
+}
+vegq_cropped <- terra::crop(vegq, r_site)
+vegq_cor <- resample(vegq_cropped, r_site, method = "bilinear")
+veg_4 <- c(r_site, d2str, d2ol, vegq_cor)
+names(veg_4)[1:3] <- c("site","d2str","d2ol")
+prepared_vq_list <- list(subcs = subcs_t, subcs_ig = subcs_ig, 
+       subc_pps = subc_pps, veg_4 = veg_4)
+gc() 
+rm(r_site, d2str, d2ol)
+
+
+
+```
+
+## Deriving attenuated vegetation quality for 132 streams in the network
+
+
+
+```{r}
+#| label: calculate_av
+
+source("code/compile_prepared_vv.R")
+
+aq_site <- function(sitecode_or_reach,
+                    prepared_data,
+                    W = 1000,
+                    max_us = 16000) {
+  
+  list2env(prepared_data, environment())
+  
+  last_char <- substr(sitecode_or_reach,
+                      nchar(sitecode_or_reach),
+                      nchar(sitecode_or_reach))
+  
+  reachi <- ifelse(last_char %in% 0:9,
+                   sitecode_or_reach,
+                   substr(sitecode_or_reach,
+                          1,
+                          nchar(sitecode_or_reach) - 1))
+  
+  sitei <- subcs$site[subcs$reach == reachi]
+  
+  ppn_us <- ifelse(last_char %in% 0:9,
+                   0,
+                   (match(last_char, letters[1:10]) - 1) * 0.1)
+  
+  m_dus <- ppn_us * subcs$tot_length_m[subcs$site == sitei]
+  
+  d2oli <- subcs$d2ol_pp[subcs$site == sitei] + m_dus
+  allusi <- subcs$site[igraph::subcomponent(subcs_ig, as.character(sitei), "in")]
+  allusi_d2ol <- subcs$d2ol_pp[match(allusi, subcs$site)]
+  
+  # Restrict the analysis to upstream sites within max_us
+  allusi_within_max_us <- allusi[allusi_d2ol < d2oli + max_us]
+  cati <- subcs[subcs$site %in% allusi_within_max_us, ]
+  rasti <- terra::crop(veg_4, cati, mask = TRUE)
+  
+  # Include only grid cells upstream of the site of interest
+  terra::values(rasti$d2ol)[
+    terra::values(rasti$d2ol) < d2oli
+  ] <- NA
+  
+  # Retain only grid cells assigned to upstream sites
+  rasti$site <- terra::ifel(
+    terra::values(rasti$site) %in% allusi_within_max_us &
+      !is.na(rasti$site),
+    rasti$site,
+    NA
+  )
+  
+  rasti <- terra::mask(rasti, rasti$site)
+  rasti <- terra::trim(rasti)
+  
+  # Correct minor inconsistencies between subcatchments and raster data
+  allusi_d2ol <- subcs$d2ol_pp[match(allusi_within_max_us, subcs$site)]
+  
+  for (i in seq_along(allusi_within_max_us)) {
+    rasti$d2ol <- terra::ifel(
+      rasti$site == allusi_within_max_us[i] &
+        rasti$d2ol < allusi_d2ol[i] - 20,
+      NA,
+      rasti$d2ol
+    )
+  }
+  
+  # Calculate distance from the site, separating stream and land distances
+  d2ol_lw <- rasti$d2ol - d2oli
+  rasti$d2ol <- d2ol_lw - rasti$d2str
+  
+  # Exclude cells below the site along the stream network
+  rasti$d2ol <- terra::ifel(
+    d2ol_lw < 0,
+    NA,
+    rasti$d2ol
+  )
+  
+  rasti <- terra::mask(rasti, rasti$d2ol)
+  
+  # Apply exponential attenuation along W only (in-stream length)
+  weight <- exp(log(0.5) * rasti$d2ol / W)
+  
+  # Calculate the weighted mean of the spatial variable
+  aq <- terra::global(rasti$lyr1 * weight,
+                      fun = "sum",
+                      na.rm = TRUE)$sum /
+        terra::global(weight * 25,
+                      fun = "sum",
+                      na.rm = TRUE)$sum
+  
+  gc()
+  aq
+}
+
+# Site names for 132 streams in the network:
+load("~/uomShare/wergStaff/RyanBurrows/Students/Nathan/Data/sites_nathan_bugs3.RData")
+
+sitecodes <- sites_nathan_bugs3$sitecode_v12
+
+if(is.null(sites_nathan_bugs3$aq_w1000)){
+  sites_nathan_bugs3$aq_w1000 <- NA
+}
+
+time_record <- Sys.time()
+for (i in 1:nrow(sites_nathan_bugs3)){
+  start_time <- Sys.time()
+  print(paste0("Calculating aq for site ", i, " of ", nrow(sites_nathan_bugs3)))
+  sites_nathan_bugs3$aq_w1000[i] <- aq_site(sites_nathan_bugs3$sitecode_v12[i],
+                                             prepared_data = prepared_vq_list,
+                                             W = 1000,
+                                             max_us = 8000)
+  end_time <- Sys.time()
+  print(paste0("Finished calculating aq for site ", i, " of ", nrow(sites_nathan_bugs3), 
+               " in ", round(difftime(end_time, start_time, units = "mins"), 2), " minutes."))
+  print(paste0("Estimated time remaining: ", round((difftime(end_time, time_record, units = "mins")/i) * (nrow(sites_nathan_bugs3) - i), 2), " minutes."))
+}
+
+saveRDS(sites_nathan_bugs3, file = "~/uomShare/wergStaff/RyanBurrows/Students/Nathan/Data/sites_nathan_bugs3_aq_w1000.rds")
+
+```
+
+
+
+
